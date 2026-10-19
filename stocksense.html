@@ -27,16 +27,16 @@
 
       function applySelect(cols){_params.set('select',cols||'*');return q;}
       function q(){}
-      q.select=function(cols='*'){applySelect(cols);_method='GET';return q;};
-      q.insert=function(data){_method='POST';_body=JSON.stringify(data);_params.set('select','*');return q;};
-      q.update=function(data){_method='PATCH';_body=JSON.stringify(data);_params.set('select','*');return q;};
+      q.select=function(cols='*'){applySelect(cols);return q;};
+      q.insert=function(data){_method='POST';_body=JSON.stringify(data);_headers['Prefer']='return=representation';_params.set('select','*');return q;};
+      q.update=function(data){_method='PATCH';_body=JSON.stringify(data);_headers['Prefer']='return=representation';_params.set('select','*');return q;};
       q.upsert=function(data,opts){
         _method='POST';_body=JSON.stringify(data);
         _headers['Prefer']='resolution=merge-duplicates,return=representation';
         if(opts?.onConflict)_params.set('on_conflict',opts.onConflict);
         _params.set('select','*');return q;
       };
-      q.delete=function(){_method='DELETE';_params.set('select','*');return q;};
+      q.delete=function(){_method='DELETE';_headers['Prefer']='return=minimal';return q;};
       q.eq=function(col,val){_params.append(col,'eq.'+val);return q;};
       q.neq=function(col,val){_params.append(col,'neq.'+val);return q;};
       q.in=function(col,vals){_params.append(col,'in.('+vals.join(',')+')');return q;};
@@ -735,14 +735,20 @@ async function acceptInvite(){
 /* ═══ LOAD DATA ═══ */
 async function loadData(){
   // Profile
-  const {data:profile}=await sb().from("profiles").select("*").eq("id",(await sb().auth.getUser()).data.user.id).single();
+  const {data:profile,error:pErr}=await sb().from("profiles").select("*").eq("id",(await sb().auth.getUser()).data.user.id).single();
+  if(pErr||!profile)throw new Error("Profil: "+(pErr?(pErr.message||JSON.stringify(pErr)):"hittades inte"));
   me=profile;
   // Venue
   if(me.role==="admin"){
     // Admin: list all venues, use first (or create)
     const {data:vens}=await sb().from("venues").select("*").order("created_at");
     if(vens&&vens.length>0)venue=vens[0];
-    else{const {data:nv}=await sb().from("venues").insert({name:"Spy Bar Stockholm"}).select().single();venue=nv;}
+    else{
+      const {data:nv,error:vErr}=await sb().from("venues").insert({name:"Spy Bar Stockholm"}).select().single();
+      if(vErr||!nv)throw new Error("Venue: "+(vErr?vErr.message:"kunde inte skapas"));
+      venue=nv;
+      await sb().from("profiles").update({venue_id:nv.id}).eq("id",me.id);
+    }
   }else{
     const {data:ven}=await sb().from("venues").select("*").eq("id",me.venue_id).single();
     venue=ven;
@@ -758,7 +764,7 @@ async function loadData(){
     bars=seeded||[];
   }
   // Products
-  const {data:prodsData}=await sb().from("products").select("*").eq("venue_id",venue.id).order("category").order("name");
+  const {data:prodsData}=await sb().from("products").select("*").eq("venue_id",venue.id).order("cat").order("name");
   products=prodsData||[];
   // Seed products if empty (admin only)
   if(products.length===0&&me.role==="admin"){
@@ -787,7 +793,10 @@ async function boot(user){
   document.getElementById("invite-screen").hidden=true;
   document.getElementById("page").innerHTML=`<div class="loading"><div class="loading-spin"></div><div style="color:var(--muted);font-size:12px">Laddar data…</div></div>`;
   document.getElementById("shell").hidden=false;
-  await loadData();
+  try{await loadData();}catch(e){
+    document.getElementById("page").innerHTML=`<div style="padding:24px;color:#e07070;font-size:13px;line-height:1.6"><b>Kunde inte ladda data</b><br>${esc(e.message||String(e))}<br><br><button class="btn-ghost btn-sm" onclick="sb().auth.signOut().then(()=>location.reload())">Logga ut</button></div>`;
+    return;
+  }
   // Update pending invite
   if(pendingInviteToken){
     const {data:inv}=await sb().from("invitations").select("*").eq("token",pendingInviteToken).eq("accepted",false).single();
