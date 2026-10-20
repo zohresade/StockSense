@@ -107,6 +107,7 @@
         _session=null;clearSession();emit('SIGNED_OUT',null);
         return{error:null};
       },
+      async getSession(){return{data:{session:_session},error:null};},
       async getUser(){
         if(!_session)return{data:{user:null},error:null};
         return{data:{user:_session.user},error:null};
@@ -612,7 +613,7 @@ let venue=null;       // {id, name}
 let bars=[];          // [{id,name,color,emoji,...}]
 let products=[];      // [{id,name,cat,mode,...}]
 let inventory={};     // {barId:{prodId:{hela,cl,antal}}}
-let apiKey="";
+let apiKey="server";
 let currentView="";
 let editBarId=null;
 let editProdId=null;
@@ -647,7 +648,7 @@ function countItems(bid){const items=inventory[bid]||{};return products.filter(p
 function canEdit(){return me&&(me.role==='admin'||me.role==='manager'||me.role==='staff');}
 function isAdmin(){return me&&me.role==='admin';}
 function isManager(){return me&&(me.role==='admin'||me.role==='manager');}
-try{apiKey=localStorage.getItem("ss-api-key")||"";}catch{}
+
 
 /* ═══ AUTH ═══ */
 function showAuthTab(tab){
@@ -1185,10 +1186,9 @@ function renderSettings(){
       <div class="settings-sec-hdr">🔑 AI-skanning</div>
       <div class="settings-row">
         <div>
-          <div class="name">Anthropic API-nyckel</div>
-          <div class="meta">${apiKey?"✓ Nyckel sparad (lokalt)":"Ej inlagd — krävs för foto-AI"}</div>
+          <div class="name">AI via servern</div>
+          <div class="meta">✓ Foto-AI körs säkert via Supabase — ingen nyckel behövs på telefonen</div>
         </div>
-        <button class="btn-ghost btn-sm" onclick="openModal('modal-api')">${apiKey?"Byt nyckel":"Lägg in nyckel"}</button>
       </div>
     </div>
     <div class="settings-sec">
@@ -1398,33 +1398,23 @@ function saveApiKey(){
 }
 
 /* ═══ AI ═══ */
-async function aiImage(b64,mime){
-  const names=products.map(p=>p.name).join("\n");
-  const r=await fetch("https://api.anthropic.com/v1/messages",{
+async function aiCall(payload){
+  const {data:{session}}=await sb().auth.getSession();
+  if(!session)throw new Error("Inte inloggad");
+  const r=await fetch(SUPA_URL+"/functions/v1/ai-scan",{
     method:"POST",
-    headers:{"Content-Type":"application/json","x-api-key":apiKey,
-      "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-ipc":"true"},
-    body:JSON.stringify({model:"claude-opus-4-5",max_tokens:300,messages:[{role:"user",content:[
-      {type:"image",source:{type:"base64",media_type:mime,data:b64}},
-      {type:"text",text:`Identify this bottle from:\n${names}\n\nReply ONLY with valid JSON (no markdown):\n{"matched_name":"exact name or null","confidence":0-100,"fill_percent":85,"reasoning":"one sentence"}`}
-    ]}]})
+    headers:{"Content-Type":"application/json","apikey":SUPA_KEY,"Authorization":"Bearer "+session.access_token},
+    body:JSON.stringify(payload)
   });
-  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${r.status}`);}
-  const d=await r.json();if(d.error)throw new Error(d.error.message);
-  return JSON.parse(d.content.map(i=>i.text||"").join("").replace(/```json|```/g,"").trim());
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok||d.error)throw new Error((d.error&&d.error.message)||d.error||d.message||("HTTP "+r.status));
+  return d;
+}
+async function aiImage(b64,mime){
+  return aiCall({kind:"image",b64,mime,names:products.map(p=>p.name),sizes:Object.fromEntries(products.map(p=>[p.name,p.mode==="spirit"?p.size_cl:0]))});
 }
 async function aiText(text){
-  const names=products.map(p=>p.name).join("\n");
-  const r=await fetch("https://api.anthropic.com/v1/messages",{
-    method:"POST",
-    headers:{"Content-Type":"application/json","x-api-key":apiKey,
-      "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-ipc":"true"},
-    body:JSON.stringify({model:"claude-haiku-4-5",max_tokens:150,messages:[{role:"user",content:
-      `Match "${text}" to:\n${names}\nReply ONLY valid JSON: {"matched_name":"exact or null","confidence":0-100}`}]})
-  });
-  if(!r.ok)throw new Error(`HTTP ${r.status}`);
-  const d=await r.json();if(d.error)throw new Error(d.error.message);
-  return JSON.parse(d.content.map(i=>i.text||"").join("").replace(/```json|```/g,"").trim());
+  return aiCall({kind:"text",text,names:products.map(p=>p.name)});
 }
 
 /* ═══ CAMERA ═══ */
@@ -1484,8 +1474,8 @@ function renderCam(){
           </div>
         </div>
         ${p.mode==="spirit"?`<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
-          <div style="font-size:10px;color:var(--muted)">AI-uppskattad fyllning</div>
-          <div style="font-size:18px;font-weight:700;color:var(--amber)">${r.fillPct}% <span style="font-size:11px">≈ ${Math.round((r.fillPct/100)*p.size_cl)}cl</span></div>
+          <div style="font-size:10px;color:var(--muted)">AI-uppskattat kvar</div>
+          <div style="font-size:18px;font-weight:700;color:var(--amber)">${Math.round((r.fillPct/100)*p.size_cl)} cl <span style="font-size:11px">av ${p.size_cl} cl</span></div>
         </div>`:""}
       </div>
       <div style="display:flex;gap:8px">
@@ -1519,7 +1509,9 @@ async function doCamAnalyze(){
     if(!r.matched_name)throw new Error("Ingen matchning — prova ett tydligare foto.");
     const p=products.find(x=>x.name===r.matched_name);
     if(!p)throw new Error("Produkten saknas i listan.");
-    camState.result={prod:p,confidence:r.confidence,fillPct:r.fill_percent??85,reasoning:r.reasoning||""};
+    let fp=r.fill_percent??85;
+    if(p.mode==="spirit"&&p.size_cl>0&&typeof r.remaining_cl==="number")fp=Math.max(0,Math.min(100,Math.round(r.remaining_cl/p.size_cl*100)));
+    camState.result={prod:p,confidence:r.confidence,fillPct:fp,reasoning:r.reasoning||""};
     camState.phase="result";
   }catch(err){camState.error=err.message||"Okänt AI-fel.";camState.phase="error";}
   renderCam();
